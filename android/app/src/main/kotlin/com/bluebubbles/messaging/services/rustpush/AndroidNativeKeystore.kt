@@ -26,6 +26,7 @@ import uniffi.rust_lib_bluebubbles.doLock
 import uniffi.rust_lib_bluebubbles.finishUnlock
 import uniffi.rust_lib_bluebubbles.isLocked
 import uniffi.rust_lib_bluebubbles.recoverKeychain
+import java.security.InvalidKeyException
 import java.security.Key
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
@@ -34,6 +35,8 @@ import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.Signature
 import java.security.interfaces.ECKey
+import java.security.interfaces.ECPrivateKey
+import java.security.interfaces.RSAPrivateKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.MGF1ParameterSpec
 import java.security.spec.PKCS8EncodedKeySpec
@@ -219,7 +222,7 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
     }
 
     @SuppressLint("WrongConstant")
-    override fun importKey(alias: String, wrappedKey: ByteArray, wrappingKeyAlias: String) {
+    override fun importKey(alias: String, wrappedKey: ByteArray, wrappingKeyAlias: String, temporary: Boolean) {
         try {
             val spec = WrappedKeyEntry(wrappedKey, wrappingKeyAlias, "RSA/ECB/OAEPPadding", null)
             keyStore.setEntry(alias, spec, null)
@@ -505,49 +508,4 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
         return when (mode) {
             is EncryptMode.Gcm -> {
                 val key = (entry as? KeyStore.SecretKeyEntry)?.secretKey
-                    ?: (fallback as? SecretKey)
-                    ?: throw IllegalArgumentException("AES key not found for alias '$alias'.")
-                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_AES}/${KeyProperties.BLOCK_MODE_GCM}/${KeyProperties.ENCRYPTION_PADDING_NONE}")
-                cipher.init(Cipher.ENCRYPT_MODE, key)
-                val iv = cipher.iv ?: throw Exception("IV cannot be null for GCM encryption")
-                iv + cipher.doFinal(plaintext)
-            }
-
-            is EncryptMode.Rsa -> {
-                val key = (entry as? KeyStore.PrivateKeyEntry)?.certificate?.publicKey
-                    ?: (fallback as? PublicKey)
-                    ?: throw IllegalArgumentException("RSA key not found for alias '$alias'.")
-                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${mode.mode.blockMode}/${mode.padding.encryptionPadding}")
-                cipher.init(Cipher.ENCRYPT_MODE, key)
-                cipher.doFinal(plaintext)
-            }
-        }
-    }
-
-    override fun decrypt(alias: String, ciphertext: ByteArray, mode: EncryptMode): ByteArray {
-        val entry = keyStore.getEntry(alias, null)
-        val fallback = if (entry == null) getFallbackKey(alias) else null
-
-        return when (mode) {
-            is EncryptMode.Gcm -> {
-                val key = (entry as? KeyStore.SecretKeyEntry)?.secretKey
-                    ?: (fallback as? SecretKey)
-                    ?: throw IllegalArgumentException("AES key not found for alias '$alias'.")
-                val iv = ciphertext.copyOfRange(0, 12)
-                val data = ciphertext.copyOfRange(12, ciphertext.size)
-                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_AES}/${KeyProperties.BLOCK_MODE_GCM}/${KeyProperties.ENCRYPTION_PADDING_NONE}")
-                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
-                cipher.doFinal(data)
-            }
-
-            is EncryptMode.Rsa -> {
-                val key = (entry as? KeyStore.PrivateKeyEntry)?.privateKey
-                    ?: (fallback as? PrivateKey)
-                    ?: throw IllegalArgumentException("RSA key not found for alias '$alias'.")
-                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${mode.mode.blockMode}/${mode.padding.encryptionPadding}")
-                cipher.init(Cipher.DECRYPT_MODE, key)
-                cipher.doFinal(ciphertext)
-            }
-        }
-    }
-}
+                    ?: (fallb
