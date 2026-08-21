@@ -15,8 +15,6 @@ import android.security.keystore.WrappedKeyEntry
 import android.util.Base64
 import android.util.Log
 import androidx.annotation.RequiresApi
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
 import uniffi.rust_lib_bluebubbles.EcCurve
 import uniffi.rust_lib_bluebubbles.EncryptMode
 import uniffi.rust_lib_bluebubbles.KeyType
@@ -30,18 +28,12 @@ import uniffi.rust_lib_bluebubbles.isLocked
 import uniffi.rust_lib_bluebubbles.recoverKeychain
 import java.security.Key
 import java.security.KeyFactory
-import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.Signature
 import java.security.interfaces.ECKey
-import java.security.interfaces.ECPrivateKey
-import java.security.interfaces.ECPublicKey
-import java.security.interfaces.RSAKey
-import java.security.interfaces.RSAPrivateKey
-import java.security.interfaces.RSAPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.MGF1ParameterSpec
 import java.security.spec.PKCS8EncodedKeySpec
@@ -62,7 +54,7 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
     }
 
     private val IMPORT_WRAP_KEY_ALIAS = "keystore:wrap-key"
-    private var cachedWrapKeyPair: KeyPair? = null
+    private val PREFS_NAME = "openbubbles_secure_fallback_store"
 
     private val KeyType.algorithm: String
         get() = when (this) {
@@ -117,48 +109,21 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
             is KeystorePadding.Pkcs1 -> KeyProperties.SIGNATURE_PADDING_RSA_PKCS1
         }
 
-    private fun getFallbackPrefs(): android.content.SharedPreferences? {
-        return try {
-            val masterKey = MasterKey.Builder(context)
-                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                .build()
-            EncryptedSharedPreferences.create(
-                context,
-                "secure_keystore_fallback",
-                masterKey,
-                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-            )
-        } catch (e: Exception) {
-            Log.e("AndroidNativeKeystore", "Failed to open EncryptedSharedPreferences", e)
-            null
-        }
-    }
-
-    private fun getFallbackKeyBytes(alias: String): ByteArray? {
-        val prefs = getFallbackPrefs() ?: return null
-        val b64 = prefs.getString(alias, null) ?: return null
-        return Base64.decode(b64, Base64.NO_WRAP)
+    private fun getFallbackPrefs(): android.content.SharedPreferences {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
     private fun getFallbackKey(alias: String): Key? {
-        val raw = getFallbackKeyBytes(alias) ?: return null
-        val prefs = getFallbackPrefs() ?: return null
-        val typeStr = prefs.getString("${alias}:type", null) ?: "EC"
+        val prefs = getFallbackPrefs()
+        val b64 = prefs.getString(alias, null) ?: return null
+        val raw = Base64.decode(b64, Base64.NO_WRAP)
+        val typeStr = prefs.getString("${alias}:type", "EC")
 
         return try {
             when (typeStr) {
-                "EC" -> {
-                    val kf = KeyFactory.getInstance("EC")
-                    kf.generatePrivate(PKCS8EncodedKeySpec(raw))
-                }
-                "RSA" -> {
-                    val kf = KeyFactory.getInstance("RSA")
-                    kf.generatePrivate(PKCS8EncodedKeySpec(raw))
-                }
-                "AES" -> {
-                    SecretKeySpec(raw, "AES")
-                }
+                "EC" -> KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(raw))
+                "RSA" -> KeyFactory.getInstance("RSA").generatePrivate(PKCS8EncodedKeySpec(raw))
+                "AES" -> SecretKeySpec(raw, "AES")
                 else -> null
             }
         } catch (e: Exception) {
@@ -217,7 +182,7 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
     }
 
     override fun createKey(alias: String, type: KeyType, accessRules: KeystoreAccessRules) {
-        if (keyStore.containsAlias(alias) || getFallbackPrefs()?.contains(alias) == true) {
+        if (keyStore.containsAlias(alias) || getFallbackPrefs().contains(alias)) {
             throw Exception("Key with alias '$alias' already exists.")
         }
         try {
@@ -244,15 +209,12 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
                 keyStore.deleteEntry(alias)
             }
         } catch (_: Exception) {}
-        getFallbackPrefs()?.edit()?.remove(alias)?.remove("${alias}:type")?.remove("${alias}:pub")?.apply()
+        getFallbackPrefs().edit().remove(alias).remove("${alias}:type").apply()
     }
 
     override fun listKeys(): List<String> {
         val keys = keyStore.aliases().toList().toMutableSet()
-        val prefs = getFallbackPrefs()
-        if (prefs != null) {
-            keys.addAll(prefs.all.keys.filter { !it.contains(":") })
-        }
+        keys.addAll(getFallbackPrefs().all.keys.filter { !it.contains(":") })
         return keys.toList()
     }
 
@@ -262,65 +224,11 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
             val spec = WrappedKeyEntry(wrappedKey, wrappingKeyAlias, "RSA/ECB/OAEPPadding", null)
             keyStore.setEntry(alias, spec, null)
         } catch (e: Exception) {
-            Log.w("AndroidNativeKeystore", "Hardware import failed with ${e.message}, falling back to software store")
-            val wrapKey = cachedWrapKeyPair?.private ?: run {
-                val entry = keyStore.getEntry(wrappingKeyAlias, null) as? KeyStore.PrivateKeyEntry
-                entry?.privateKey
-            } ?: throw e
-
-            try {
-                // Распаковываем DER ASN.1 SecureKeyWrapper программно
-                val rawKey = decryptWrappedKeyData(wrappedKey, wrapKey)
-                val prefs = getFallbackPrefs() ?: throw e
-
-                // Автодетекция типа ключа
-                val isEc = try {
-                    KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(rawKey))
-                    true
-                } catch (_: Exception) { false }
-
-                val type = if (isEc) "EC" else "AES"
-
-                prefs.edit()
-                    .putString(alias, Base64.encodeToString(rawKey, Base64.NO_WRAP))
-                    .putString("${alias}:type", type)
-                    .apply()
-
-                Log.i("AndroidNativeKeystore", "Successfully imported key '$alias' into software fallback")
-            } catch (inner: Exception) {
-                Log.e("AndroidNativeKeystore", "Software unwrapping failed", inner)
-                throw e
-            }
-        }
-    }
-
-    private fun decryptWrappedKeyData(wrappedKeyDer: ByteArray, unwrapKey: PrivateKey): ByteArray {
-        // Парсим DER: [0] = ver, [1] = EncryptedTransportKey, [2] = IV, [3] = KeyDesc, [4] = EncryptedKey, [5] = AuthTag
-        val rsaCipher = Cipher.getInstance("RSA/ECB/OAEPWithSHA-256AndMGF1Padding")
-        val oaepSpec = OAEPParameterSpec("SHA-256", "MGF1", MGF1ParameterSpec.SHA1, PSource.PSpecified.DEFAULT)
-        rsaCipher.init(Cipher.DECRYPT_MODE, unwrapKey, oaepSpec)
-
-        // Простое извлечение полезной нагрузки, если ASN.1 DER передан напрямую
-        return try {
-            val offset = 4
-            val encTransportKeyLen = 256
-            val encTransportKey = wrappedKeyDer.copyOfRange(offset + 3, offset + 3 + encTransportKeyLen)
-            val transportKeyBytes = rsaCipher.doFinal(encTransportKey)
-
-            val ivOffset = offset + 3 + encTransportKeyLen
-            val ivLen = wrappedKeyDer[ivOffset + 1].toInt()
-            val iv = wrappedKeyDer.copyOfRange(ivOffset + 2, ivOffset + 2 + ivLen)
-
-            val tagLen = 16
-            val encryptedPayload = wrappedKeyDer.copyOfRange(wrappedKeyDer.size - tagLen - 590, wrappedKeyDer.size)
-
-            val aesGcm = Cipher.getInstance("AES/GCM/NoPadding")
-            val secretKey = SecretKeySpec(transportKeyBytes, "AES")
-            aesGcm.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(128, iv))
-            aesGcm.doFinal(encryptedPayload)
-        } catch (_: Exception) {
-            // Если структура сложная, возвращаем байты как RAW
-            wrappedKeyDer
+            Log.w("AndroidNativeKeystore", "Hardware import failed with ${e.message}, falling back to software storage")
+            getFallbackPrefs().edit()
+                .putString(alias, Base64.encodeToString(wrappedKey, Base64.NO_WRAP))
+                .putString("${alias}:type", "EC")
+                .apply()
         }
     }
 
@@ -356,10 +264,9 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
         if (entry == null) {
             val fallbackKey = getFallbackKey(alias) ?: return null
             return when (fallbackKey) {
-                is ECPrivateKey -> KeyType.Ec(EcCurve.P256)
-                is RSAPrivateKey -> KeyType.Rsa(2048.toUShort())
+                is ECKey -> KeyType.Ec(EcCurve.P256)
                 is SecretKey -> KeyType.Aes(256.toUShort())
-                else -> null
+                else -> KeyType.Rsa(2048.toUShort())
             }
         }
 
@@ -433,14 +340,9 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
         sig: ByteArray
     ): Boolean {
         try {
-            val publicKey: PublicKey = (keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry)?.certificate?.publicKey
-                ?: run {
-                    val priv = getFallbackKey(alias) as? ECPrivateKey ?: throw Exception("Key not found")
-                    val kf = KeyFactory.getInstance("EC")
-                    val ecPoint = org.bouncycastle.jce.ECPointUtil.decodePoint(null, priv.encoded)
-                    // fallback verify via signature
-                    throw Exception("Fallback verification unsupported")
-                }
+            val entry = keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry
+            val publicKey: PublicKey = entry?.certificate?.publicKey
+                ?: throw Exception("Public key certificate not available for $alias")
 
             val sigKeyAlgorithm = if (publicKey.algorithm == "EC" || publicKey.algorithm == KeyProperties.KEY_ALGORITHM_EC) {
                 "ECDSA"
@@ -462,10 +364,6 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
         val cert = keyStore.getCertificate(alias)
         if (cert != null) {
             return cert.publicKey.encoded
-        }
-        val fallback = getFallbackKey(alias)
-        if (fallback is ECPrivateKey) {
-            return fallback.encoded
         }
         throw Exception("Public key not found for alias $alias")
     }
@@ -498,4 +396,158 @@ class AndroidNativeKeystore(val context: Context) : NativeKeystore {
             return
         }
 
-        val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${KeyProperties.BLOCK_MODE_ECB}/${KeyPr
+        val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${KeyProperties.BLOCK_MODE_ECB}/${KeyProperties.ENCRYPTION_PADDING_RSA_OAEP}")
+        val spec = OAEPParameterSpec(
+            KeyProperties.DIGEST_SHA256,
+            "MGF1",
+            MGF1ParameterSpec(KeyProperties.DIGEST_SHA1),
+            PSource.PSpecified.DEFAULT
+        )
+
+        try {
+            cipher.init(Cipher.DECRYPT_MODE, key, spec)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            recoverKeychain()
+        } catch (e: InvalidKeyException) {
+            recoverKeychain()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.P)
+    fun unlockKeystore(title: String, callback: (success: Boolean) -> Unit) {
+        if (!isLocked()) {
+            callback(true)
+            return
+        }
+
+        val entry = keyStore.getEntry("keystore:recovery:master", null)
+        val key = (entry as? KeyStore.PrivateKeyEntry)?.privateKey
+        if (key == null) {
+            recoverKeychain()
+            unlockKeystore(title, callback)
+            return
+        }
+
+        val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${KeyProperties.BLOCK_MODE_ECB}/${KeyProperties.ENCRYPTION_PADDING_RSA_OAEP}")
+        val spec = OAEPParameterSpec(
+            KeyProperties.DIGEST_SHA256,
+            "MGF1",
+            MGF1ParameterSpec(KeyProperties.DIGEST_SHA1),
+            PSource.PSpecified.DEFAULT
+        )
+
+        try {
+            cipher.init(Cipher.DECRYPT_MODE, key, spec)
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            recoverKeychain()
+            unlockKeystore(title, callback)
+            return
+        }
+
+        val factory = KeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
+        val keyInfo = factory.getKeySpec(key, KeyInfo::class.java)
+
+        if (!keyInfo.isUserAuthenticationRequired) {
+            savedCipher = cipher
+            finishUnlock()
+            callback(true)
+            return
+        }
+
+        val builder = BiometricPrompt.Builder(context)
+            .setTitle(title)
+            .setDescription("iCloud Keychain is used for Find My and Messages in iCloud. OpenBubbles requires user authentication when managing iCloud Keychain for extra security.")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            builder.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG or BiometricManager.Authenticators.DEVICE_CREDENTIAL)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            builder.setDeviceCredentialAllowed(true)
+        }
+
+        val prompt = builder.build()
+
+        prompt.authenticate(BiometricPrompt.CryptoObject(cipher), CancellationSignal(), context.mainExecutor, object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
+                savedCipher = result!!.cryptoObject.cipher
+                finishUnlock()
+                callback(true)
+            }
+
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                Log.e("BiometricFailed", "Authentication failed $errorCode $errString")
+                callback(false)
+            }
+
+            override fun onAuthenticationFailed() {
+                callback(false)
+            }
+        })
+    }
+
+    override fun derive(alias: String, peer: ByteArray): ByteArray {
+        val privateKey: PrivateKey = (keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry)?.privateKey
+            ?: (getFallbackKey(alias) as? PrivateKey)
+            ?: throw Exception("Private key not found for derivation: $alias")
+
+        val keyFactory = KeyFactory.getInstance(privateKey.algorithm)
+        val peerPublicKey = keyFactory.generatePublic(X509EncodedKeySpec(peer))
+
+        val keyAgreement = KeyAgreement.getInstance("ECDH")
+        keyAgreement.init(privateKey)
+        keyAgreement.doPhase(peerPublicKey, true)
+        return keyAgreement.generateSecret()
+    }
+
+    override fun encrypt(alias: String, plaintext: ByteArray, mode: EncryptMode): ByteArray {
+        val entry = keyStore.getEntry(alias, null)
+        val fallback = if (entry == null) getFallbackKey(alias) else null
+
+        return when (mode) {
+            is EncryptMode.Gcm -> {
+                val key = (entry as? KeyStore.SecretKeyEntry)?.secretKey
+                    ?: (fallback as? SecretKey)
+                    ?: throw IllegalArgumentException("AES key not found for alias '$alias'.")
+                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_AES}/${KeyProperties.BLOCK_MODE_GCM}/${KeyProperties.ENCRYPTION_PADDING_NONE}")
+                cipher.init(Cipher.ENCRYPT_MODE, key)
+                val iv = cipher.iv ?: throw Exception("IV cannot be null for GCM encryption")
+                iv + cipher.doFinal(plaintext)
+            }
+
+            is EncryptMode.Rsa -> {
+                val key = (entry as? KeyStore.PrivateKeyEntry)?.certificate?.publicKey
+                    ?: (fallback as? PublicKey)
+                    ?: throw IllegalArgumentException("RSA key not found for alias '$alias'.")
+                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${mode.mode.blockMode}/${mode.padding.encryptionPadding}")
+                cipher.init(Cipher.ENCRYPT_MODE, key)
+                cipher.doFinal(plaintext)
+            }
+        }
+    }
+
+    override fun decrypt(alias: String, ciphertext: ByteArray, mode: EncryptMode): ByteArray {
+        val entry = keyStore.getEntry(alias, null)
+        val fallback = if (entry == null) getFallbackKey(alias) else null
+
+        return when (mode) {
+            is EncryptMode.Gcm -> {
+                val key = (entry as? KeyStore.SecretKeyEntry)?.secretKey
+                    ?: (fallback as? SecretKey)
+                    ?: throw IllegalArgumentException("AES key not found for alias '$alias'.")
+                val iv = ciphertext.copyOfRange(0, 12)
+                val data = ciphertext.copyOfRange(12, ciphertext.size)
+                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_AES}/${KeyProperties.BLOCK_MODE_GCM}/${KeyProperties.ENCRYPTION_PADDING_NONE}")
+                cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+                cipher.doFinal(data)
+            }
+
+            is EncryptMode.Rsa -> {
+                val key = (entry as? KeyStore.PrivateKeyEntry)?.privateKey
+                    ?: (fallback as? PrivateKey)
+                    ?: throw IllegalArgumentException("RSA key not found for alias '$alias'.")
+                val cipher = Cipher.getInstance("${KeyProperties.KEY_ALGORITHM_RSA}/${mode.mode.blockMode}/${mode.padding.encryptionPadding}")
+                cipher.init(Cipher.DECRYPT_MODE, key)
+                cipher.doFinal(ciphertext)
+            }
+        }
+    }
+}
